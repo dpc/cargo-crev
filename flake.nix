@@ -199,6 +199,7 @@
             "crev-data"
             "crev-lib"
             "crev-wot"
+            "crevette"
           ];
         };
       in
