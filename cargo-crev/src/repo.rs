@@ -1,5 +1,8 @@
 use crate::{opts, opts::CrateSelector};
 use anyhow::format_err;
+use cargo::sources::source::{QueryKind, Source, SourceMap};
+use cargo::sources::SourceConfigMap;
+use cargo::GlobalContext;
 use cargo::{
     core::{
         dependency::{DepKind, Dependency},
@@ -7,12 +10,12 @@ use cargo::{
         package::PackageSet,
         registry::PackageRegistry,
         resolver::{CliFeatures, HasDevUnits},
-        source::SourceMap,
-        Package, PackageId, PackageIdSpec, Resolve, SourceId, Workspace,
+        Package, PackageId, Resolve, SourceId, Workspace,
     },
     ops,
     util::{
-        config::{Config, ConfigValue},
+        cache_lock::CacheLockMode,
+        context::ConfigValue,
         important_paths::find_root_manifest_for_wd,
         CargoResult, Rustc,
     },
@@ -54,7 +57,7 @@ impl Graph {
                 self.graph
                     .neighbors_directed(*node_idx, petgraph::Direction::Outgoing)
             })
-            .map(move |node_idx| self.graph.node_weight(node_idx).unwrap().id)
+            .filter_map(move |node_idx| Some(self.graph.node_weight(node_idx)?.id))
     }
 
     pub fn get_reverse_dependencies_of(
@@ -68,7 +71,7 @@ impl Graph {
                 self.graph
                     .neighbors_directed(*node_idx, petgraph::Direction::Incoming)
             })
-            .map(move |node_idx| self.graph.node_weight(node_idx).unwrap().id)
+            .filter_map(move |node_idx| Some(self.graph.node_weight(node_idx)?.id))
     }
 
     pub fn get_recursive_dependencies_of(&self, root_pkg_id: PackageId) -> HashSet<PackageId> {
@@ -82,19 +85,20 @@ impl Graph {
 
             if processed.contains(&pkg_id) {
                 continue;
-            } else {
-                processed.insert(pkg_id);
             }
 
+            processed.insert(pkg_id);
+
             if let Some(node_idx) = self.nodes.get(&pkg_id) {
-                for node_idx in self
+                for node in self
                     .graph
                     .neighbors_directed(*node_idx, petgraph::Direction::Outgoing)
+                    .filter_map(|node_idx| self.graph.node_weight(node_idx))
                 {
-                    pending.insert(self.graph.node_weight(node_idx).unwrap().id);
+                    pending.insert(node.id);
                 }
             } else {
-                eprintln!("No node for {pkg_id} when checking recdeps for {root_pkg_id}");
+                log::error!("No node for {pkg_id} when checking recdeps for {root_pkg_id}");
             }
         }
 
@@ -111,34 +115,31 @@ fn get_cfgs(rustc: &Rustc, target: Option<&str>) -> Result<Vec<Cfg>> {
         process.arg("--target").arg(s);
     }
 
-    let output = match process.exec_with_output() {
-        Ok(output) => output,
-        Err(e) => return Err(e),
-    };
-    let output = str::from_utf8(&output.stdout).unwrap();
+    let output = process.exec_with_output()?;
+    let output = str::from_utf8(&output.stdout)?;
     let lines = output.lines();
     Ok(lines
         .map(Cfg::from_str)
         .collect::<std::result::Result<Vec<_>, cargo_platform::ParseError>>()?)
 }
 
-fn our_resolve<'a, 'cfg>(
+fn our_resolve<'cfg>(
     mut registry: PackageRegistry<'cfg>,
-    workspace: &'a Workspace<'cfg>,
+    workspace: &Workspace<'cfg>,
     features: &[String],
     all_features: bool,
     no_default_features: bool,
 ) -> CargoResult<(PackageSet<'cfg>, Resolve)> {
-    let _lock = workspace.config().acquire_package_cache_lock()?;
-    let (packages, resolve) = cargo::ops::resolve_ws(workspace)?;
+    let _lock = workspace.gctx()
+        .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+    let (packages, resolve) = cargo::ops::resolve_ws(workspace, false)?;
 
     let cli_features =
         CliFeatures::from_command_line(features, all_features, !no_default_features)?;
 
     let specs: Vec<_> = workspace
         .members()
-        .map(|m| m.summary().package_id())
-        .map(PackageIdSpec::from_package_id)
+        .map(|m| m.summary().package_id().to_spec())
         .collect();
 
     let resolve = ops::resolve_with_previous(
@@ -231,7 +232,7 @@ fn build_graph<'a>(
 fn prune_directory_source_replacements(
     config: &mut HashMap<String, ConfigValue>,
 ) -> CargoResult<()> {
-    if let Some(ConfigValue::Table(ref mut source_config, _)) = config.get_mut("source") {
+    if let Some(ConfigValue::Table(source_config, _)) = config.get_mut("source") {
         // To do the pruning, first, generate a graph of registry sources, where the node are the sources, and there is an edge if a source
         //  defines that it is replaced with another source.
         // Then, find the directory sources, and traverse the graph in reverse to find all the sources that are directory sources, or reference them
@@ -243,16 +244,18 @@ fn prune_directory_source_replacements(
             .map(|source_key| (source_key, source_graph.add_node(source_key.clone())))
             .collect::<HashMap<_, _>>();
 
-        for (source_name, source_config_entry) in source_config.iter() {
+        for (source_name, source_config_entry) in &*source_config {
             if let ConfigValue::Table(source_config_entry, _) = source_config_entry {
-                if let Some(ConfigValue::String(replacement, _)) =
+                if let Some(ConfigValue::String(replacement_name, _)) =
                     source_config_entry.get("replace-with")
                 {
-                    source_graph.add_edge(
-                        *nodes.get(source_name).unwrap(),
-                        *nodes.get(replacement).unwrap(),
-                        (),
-                    );
+                    let source = nodes.get(source_name);
+                    let replacement = nodes.get(replacement_name);
+                    if let Some((source, replacement)) = source.zip(replacement) {
+                        source_graph.add_edge(*source, *replacement, ());
+                    } else {
+                        log::warn!("Incomplete replace-with source replacement config: {source_name} -> {replacement_name}");
+                    }
                 }
             }
         }
@@ -284,7 +287,7 @@ fn prune_directory_source_replacements(
 
 /// A handle to the current Rust project
 pub struct Repo {
-    config: Config,
+    config: GlobalContext,
     cargo_opts: opts::CargoOpts,
     features_list: Vec<String>,
 }
@@ -304,7 +307,7 @@ impl Repo {
     }
 
     pub fn auto_open_cwd(cargo_opts: opts::CargoOpts) -> Result<Self> {
-        let mut config = Config::default()?;
+        let mut config = GlobalContext::default()?;
 
         config.configure(
             0,
@@ -351,13 +354,15 @@ impl Repo {
         &self,
         source_ids: impl Iterator<Item = SourceId>,
     ) -> CargoResult<PackageRegistry<'_>> {
-        let _lock = self.config.acquire_package_cache_lock()?;
-        let mut registry = PackageRegistry::new(&self.config)?;
+        let _lock = self
+            .config
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+        let mut registry = PackageRegistry::new_with_source_config(&self.config, SourceConfigMap::new(&self.config)?)?;
         registry.add_sources(source_ids)?;
         Ok(registry)
     }
 
-    fn get_registry_from_workspace_members(&self) -> Result<(Workspace, PackageRegistry<'_>)> {
+    fn get_registry_from_workspace_members(&self) -> Result<(Workspace<'_>, PackageRegistry<'_>)> {
         let workspace = self.workspace()?;
         let registry = self.registry(workspace.members().map(|m| m.summary().source_id()))?;
         Ok((workspace, registry))
@@ -408,7 +413,7 @@ impl Repo {
         Ok(())
     }
 
-    pub fn load_source<'a>(&'a self) -> Result<Box<dyn cargo::core::source::Source + 'a>> {
+    pub fn load_source<'a>(&'a self) -> Result<Box<dyn Source + 'a>> {
         let source_id = SourceId::crates_io(&self.config)?;
         let map = cargo::sources::SourceConfigMap::new(&self.config)?;
         let yanked_whitelist = HashSet::new();
@@ -419,7 +424,7 @@ impl Repo {
     pub fn load_source_with_whitelist<'a>(
         &'a self,
         yanked_whitelist: HashSet<PackageId>,
-    ) -> Result<Box<dyn cargo::core::source::Source + 'a>> {
+    ) -> Result<Box<dyn Source + 'a>> {
         let source_id = SourceId::crates_io(&self.config)?;
         let map = cargo::sources::SourceConfigMap::new(&self.config)?;
         let source = map.load(source_id, &yanked_whitelist)?;
@@ -581,30 +586,32 @@ impl Repo {
             // special case - we need to whitelist the crate, in case it was yanked
             let mut yanked_whitelist = HashSet::default();
             let source_id = SourceId::crates_io(&self.config)?;
-            yanked_whitelist.insert(PackageId::new(name, version, source_id)?);
+            yanked_whitelist.insert(PackageId::new(name.into(), version.clone(), source_id));
             self.load_source_with_whitelist(yanked_whitelist)?
         } else {
             self.load_source()?
         };
-        let mut summaries = vec![];
         let version_str = version.map(ToString::to_string);
         let dependency_request =
             Dependency::parse(name, version_str.as_deref(), source.source_id())?;
-        let _lock = self.config.acquire_package_cache_lock()?;
-        if !source
-            .query(
-                &dependency_request,
-                cargo::core::QueryKind::Exact,
-                &mut |summary| summaries.push(summary),
-            )
-            .is_ready()
-        {
-            source.block_until_ready()?;
-        }
+        let _lock = self
+            .config
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+        let summaries = loop {
+            // Exact to avoid returning all for path/git
+            match source.query_vec(&dependency_request, QueryKind::Exact) {
+                std::task::Poll::Ready(res) => break res?,
+                std::task::Poll::Pending => source.block_until_ready()?,
+            }
+        };
         let summary = if let Some(version) = version {
-            summaries.iter().find(|s| s.version() == version)
+            summaries
+                .iter()
+                .find(|&s| s.as_summary().version() == version)
         } else {
-            summaries.iter().max_by_key(|s| s.version())
+            summaries
+                .iter()
+                .max_by_key(|&s| (!s.is_yanked(), s.as_summary().version()))
         };
 
         Ok(summary.map(|s| s.package_id()))
@@ -619,21 +626,22 @@ impl Repo {
         if unrelated {
             Ok(
                 self.find_independent_pkg_id_by_selector(name, version)?
-                    .ok_or_else(|| format_err!("Could not find requested crate. Try updating cargo's registry index cache?"))?
+                    .ok_or_else(|| format_err!("Could not find requested crate '{name}'. Try updating cargo's registry index cache?"))?
                 )
         } else {
             Ok(self.find_dependency_pkg_id_by_selector(name, version)?
-                    .ok_or_else(|| format_err!("Could not find requested crate. Try `-u` if the crate is not a dependency."))?
+                    .ok_or_else(|| format_err!("Could not find requested crate '{name}'. Try `-u` if the crate is not a dependency."))?
                     )
         }
     }
 
     pub fn find_pkgid_by_crate_selector(&self, sel: &CrateSelector) -> Result<PackageId> {
         sel.ensure_name_given()?;
+        let name = sel.name.as_ref().unwrap();
 
-        let version = sel.version()?.cloned().map(Version::from);
+        let version = sel.version()?.cloned();
 
-        self.find_pkgid(sel.name.as_ref().unwrap(), version.as_ref(), sel.unrelated)
+        self.find_pkgid(name, version.as_ref(), sel.unrelated)
     }
 
     pub fn find_roots_by_crate_selector(&self, sel: &CrateSelector) -> Result<Vec<PackageId>> {
@@ -652,7 +660,7 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cargo::util::config::Definition;
+    use cargo::util::context::Definition;
 
     #[test]
     fn test_prune_directory_source_replacement() {

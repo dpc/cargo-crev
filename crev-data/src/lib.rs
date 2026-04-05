@@ -1,11 +1,15 @@
 //! This crate contains only code handling data types
 //! used by `crev`, without getting into details
 //! how actually `crev` works (where and how it manages data).
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::module_name_repetitions)]
 
 pub mod digest;
 pub mod id;
 pub mod level;
-mod prelude;
 pub mod proof;
 pub mod url;
 #[macro_use]
@@ -24,6 +28,12 @@ pub use crate::{
     },
     url::Url,
 };
+
+/// It's just a string. See [`SOURCE_CRATES_IO`]
+pub type RegistrySource<'a> = &'a str;
+
+/// Constant for `source` arguments, indicating
+pub const SOURCE_CRATES_IO: RegistrySource<'static> = "https://crates.io";
 
 #[cfg(test)]
 mod tests;

@@ -1,15 +1,35 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic
-Versioning](https://semver.org/spec/v2.0.0.html).
-
 <!-- next-url -->
-## [Unreleased](https://github.com/crev-dev/cargo-crev/compare/v0.23.0...HEAD) - ReleaseDate
+## [Unreleased](https://github.com/crev-dev/cargo-crev/compare/v0.26.4...HEAD) - ReleaseDate
 
-- Added `--direct` flag to trust paramaters to use only directly trusted Ids
+- Added mac keychain support to safely store and retrieve passphrases
+
+## [0.26.4](https://github.com/crev-dev/cargo-crev/compare/v0.26.0...v0.26.4) - 2025-04-12
+
+- Updated dependencies to allow use of the 2024 edition.
+- `geiger` dependency is optional (build with `--features=geiger` to enable)
+
+- Implement `crev proof find --git-rev 0f0f0f`.
+- Make filer for `crev proof find --version 1.1.1` indepent of name filter.
+
+## [0.26.0](https://github.com/crev-dev/cargo-crev/compare/v0.25.11...v0.26.0) - 2024-11-07
+
+- Fixed handling of the `--diff` flag.
+
+## [0.25.11](https://github.com/crev-dev/cargo-crev/compare/v0.25.9...v0.25.11) - 2024-10-24
+
+- Updated dependencies
+
+## [0.25.9](https://github.com/crev-dev/cargo-crev/compare/v0.24.0...v0.25.9) - 2024-05-19
+
+- `crevette` tool for `cargo-crev` to `cargo-vet` export
+- `cargo crev review --diff` suggests a URL for viewing a diff
+- `cargo crev review` remembers the last `cargo crev open` crate.
+
+## [0.24.0](https://github.com/crev-dev/cargo-crev/compare/v0.23.0...v0.24.3)
+
+- Added `--direct` flag to trust parameters to use only directly trusted Ids
 - Added command "proof reissue" to reissue reviews under a different id.
   The original proof will be referenced in the new proof under the "original:" field
 - Fix crash on systems with libgit2 v1.4
@@ -173,7 +193,7 @@ improvements
 - **BREAKING**: `cargo crev <verb> <noun>` was change to `cargo crev <noun>
   <verb>`
 - Introduces one letter aliases for most (all?) commands
-- Commands quering proofs will now print them as a multi-object yaml document
+- Commands querying proofs will now print them as a multi-object yaml document
   for easier parsing
 - Shortened `=1.2.3` in `latest_t` to just `=`
 
@@ -184,7 +204,7 @@ improvements
 - `crate mvp` to discovering best reviewers
 - `crate search` for looking up best reviewed dependency candidates
 - `crate verify --recursive`
-- `CREV_PASSPHRASE_CMD` for users of `pass` and similiar
+- `CREV_PASSPHRASE_CMD` for users of `pass` and similar
 - Multiple flags and arguments to narrow down `crate verify` scope
 - Handling of `--level <level>` in many commands
 - "Tips and tricks" in user
@@ -218,7 +238,7 @@ documentation
 - User Documentation, including Getting Started Guide
 - `query dir` command
 - Differential reviews with `diff` and `review --diff` commands
-- New options, particularily for
+- New options, particularly for
 `verify`
 
 ## [0.7.0](https://github.com/dpc/crev/compare/cargo-crev-v0.6.0...cargo-crev-v0.7.0) - 2019-04-27

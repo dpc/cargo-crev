@@ -3,14 +3,13 @@
 use crate::{
     deps::scan::{self, RequiredDetails},
     edit, opts,
-    opts::CrateSelector,
+    opts::{CrateSelector, ReviewCrateSelector},
     prelude::*,
-    repo::*,
+    repo::Repo,
 };
 use anyhow::{format_err, Context, Result};
-use crev_data::{proof, review::Package};
+use crev_data::{proof, review::Package, SOURCE_CRATES_IO};
 use crev_lib::{self, local::Local, ProofStore, ReviewMode};
-use resiter::FlatMap;
 use serde::Deserialize;
 use std::{
     collections::HashSet,
@@ -31,9 +30,6 @@ pub const GOTO_CRATE_VERSION_ENV: &str = "CARGO_CREV_GOTO_ORIGINAL_VERSION";
 /// Name of file we store user-personalized
 pub const KNOWN_CARGO_OWNERS_FILE: &str = "known_cargo_owners.txt";
 
-/// Constant we use for `source` in the review proof
-pub const PROJECT_SOURCE_CRATES_IO: &str = "https://crates.io";
-
 /// The file added to crates containing vcs revision
 pub const VCS_INFO_JSON_FILE: &str = ".cargo_vcs_info.json";
 
@@ -44,8 +40,7 @@ pub struct VcsInfoJson {
 }
 
 pub fn vcs_info_to_revision_string(vcs: Option<VcsInfoJson>) -> String {
-    vcs.and_then(|vcs| vcs.get_git_revision())
-        .unwrap_or_default()
+    vcs.map(|vcs| vcs.get_git_revision()).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,9 +61,9 @@ impl VcsInfoJson {
             Ok(None)
         }
     }
-    fn get_git_revision(&self) -> Option<String> {
+    fn get_git_revision(&self) -> String {
         let VcsInfoJsonGit::Sha1(ref s) = self.git;
-        Some(s.to_string())
+        s.to_string()
     }
 }
 
@@ -127,10 +122,10 @@ pub fn goto_crate_src(selector: &opts::CrateSelector) -> Result<()> {
     let crate_version = crate_.version();
     let local = crev_lib::Local::auto_create_or_open()?;
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         &crate_.name(),
         crate_version,
-        &crev_lib::ReviewActivity::new_full(),
+        &crev_lib::ReviewActivity::new(None),
     )?;
 
     let shell = env::var_os("SHELL").ok_or_else(|| format_err!("$SHELL not set"))?;
@@ -145,7 +140,7 @@ pub fn goto_crate_src(selector: &opts::CrateSelector) -> Result<()> {
         .env("PWD", crate_dir)
         .env(GOTO_ORIGINAL_DIR_ENV, cwd)
         .env(GOTO_CRATE_NAME_ENV, crate_name)
-        .env(GOTO_CRATE_VERSION_ENV, &crate_version.to_string());
+        .env(GOTO_CRATE_VERSION_ENV, crate_version.to_string());
 
     exec_into(command)
 }
@@ -269,11 +264,22 @@ pub fn get_open_cmd(local: &Local) -> Result<String> {
 /// Open a crate
 ///
 /// * `unrelated` - the crate might not actually be a dependency
-pub fn crate_open(crate_sel: &CrateSelector, cmd: Option<String>, cmd_save: bool) -> Result<()> {
+pub fn crate_open(
+    crate_sel: &ReviewCrateSelector,
+    cmd: Option<String>,
+    cmd_save: bool,
+) -> Result<()> {
     let local = Local::auto_create_or_open()?;
     let repo = Repo::auto_open_cwd_default()?;
-    let crate_id = repo.find_pkgid_by_crate_selector(crate_sel)?;
+    let crate_id = repo.find_pkgid_by_crate_selector(&crate_sel.crate_)?;
     let cargo_crate = repo.get_crate(&crate_id)?;
+
+    if let Some(Some(base_ver)) = &crate_sel.diff {
+        println!("View the diff online:\nhttps://diff.rs/{name}/{base_ver}/{name}/{new_ver}/Cargo.toml\n",
+            name = cargo_crate.name(),
+            new_ver = cargo_crate.version(),
+        );
+    }
 
     if cmd_save {
         if let Some(cmd) = &cmd {
@@ -289,17 +295,17 @@ pub fn crate_open(crate_sel: &CrateSelector, cmd: Option<String>, cmd_save: bool
 
     // It's not safe to open Cargo's crate dir directly, because editor integration (like cargo check)
     // could automatically start running crate's potentially malicious build script or proc macros.
-    let dest_dir = local.sanitized_crate_copy(PROJECT_SOURCE_CRATES_IO, &name, version, src_dir)?;
+    let dest_dir = local.sanitized_crate_copy(SOURCE_CRATES_IO, &name, version, src_dir)?;
 
     let open_cmd = match cmd {
         Some(cmd) => cmd,
         None => get_open_cmd(&local)?,
     };
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         &name,
         version,
-        &crev_lib::ReviewActivity::new_full(),
+        &crev_lib::ReviewActivity::new(crate_sel.diff.as_ref().and_then(|diff| diff.clone())),
     )?;
     let status = crev_lib::util::run_with_shell_cmd(open_cmd.as_ref(), Some(&dest_dir))?;
 
@@ -359,7 +365,7 @@ pub fn crate_review_activity_check(
     diff: &Option<Option<Version>>,
     skip_activity_check: bool,
 ) -> Result<Option<Version>, ActivityCheckError> {
-    let activity = local.read_review_activity(PROJECT_SOURCE_CRATES_IO, name, version)?;
+    let activity = local.read_review_activity(SOURCE_CRATES_IO, name, version)?;
 
     let diff = match diff {
         None => None,
@@ -390,7 +396,10 @@ pub fn crate_review_activity_check(
             }
         }
 
-        if activity.timestamp + chrono::Duration::days(2) < crev_common::now() {
+        if activity.timestamp
+            + chrono::Duration::try_days(2).expect("2 days doesn't overflow TimeDelta")
+            < crev_common::now()
+        {
             return Err(ActivityCheckError::Expired);
         }
     } else {
@@ -463,11 +472,7 @@ pub fn find_advisories(crate_: &opts::CrateSelector) -> Result<Vec<proof::review
     let db = local.load_db()?;
 
     Ok(db
-        .get_advisories(
-            PROJECT_SOURCE_CRATES_IO,
-            crate_.name.as_deref(),
-            crate_.version()?,
-        )
+        .get_advisories(SOURCE_CRATES_IO, crate_.name.as_deref(), crate_.version()?)
         .cloned()
         .collect())
 }
@@ -493,7 +498,7 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
         .or_else(|| {
             crev_lib::find_latest_trusted_version(
                 &trust_set,
-                PROJECT_SOURCE_CRATES_IO,
+                SOURCE_CRATES_IO,
                 name,
                 &requirements,
                 &db,
@@ -504,10 +509,10 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
     let src_crate = repo.get_crate(&src_crate_id)?;
 
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         name,
         dst_crate.version(),
-        &crev_lib::ReviewActivity::new_diff(&src_version),
+        &crev_lib::ReviewActivity::new(Some(src_version)),
     )?;
 
     use std::process::Command;
@@ -539,7 +544,7 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
             let mut command = diff(diff_exe.as_os_str());
             command
                 .status()
-                .or_else(|err| panic!("Failed to execute {command:?}\n{err:?}"))
+                .map_err(|err| panic!("Failed to execute {command:?}\n{err:?}"))
         }
         Err(ref err) => panic!("Failed to execute {command:?}\n{err:?}"),
         Ok(status) => Ok(status),
@@ -574,7 +579,7 @@ pub fn list_issues(args: &opts::RepoQueryIssue) -> Result<()> {
     let trust_set = db.calculate_trust_set(&current_id, &trust_distance_params);
 
     for review in db.get_pkg_reviews_with_issues_for(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         args.crate_.name.as_deref(),
         args.crate_.version()?,
         &trust_set,
@@ -599,34 +604,60 @@ pub fn are_we_called_from_goto_shell() -> Option<OsString> {
 /// After jumping to a crate with `goto`, the crate is selected
 /// already, and commands like `review` must not be given any arguments
 /// like that.
-pub fn handle_goto_mode_command<F>(args: &opts::ReviewOrGotoCommon, f: F) -> Result<()>
+pub fn handle_goto_mode_command<F>(
+    args: &opts::ReviewCrateSelector,
+    local_for_review: Option<&Local>,
+    f: F,
+) -> Result<()>
 where
-    F: FnOnce(&CrateSelector) -> Result<()>,
+    F: FnOnce(&ReviewCrateSelector) -> Result<()>,
 {
     if let Some(org_dir) = are_we_called_from_goto_shell() {
         if args.crate_.name.is_some() {
             bail!("In `crev goto` mode no arguments can be given");
-        } else {
-            let name = env::var(GOTO_CRATE_NAME_ENV)
-                .map_err(|_| format_err!("crate name env var not found"))?;
-            let version = env::var(GOTO_CRATE_VERSION_ENV)
-                .map_err(|_| format_err!("crate version env var not found"))?;
-
-            env::set_current_dir(org_dir)?;
-            f(&CrateSelector::new(
-                Some(name),
-                Some(Version::parse(&version)?),
-                true,
-            ))?;
         }
-    } else {
-        args.crate_.ensure_name_given()?;
+        if args.diff.is_some() {
+            bail!("In `crev goto` mode diff can't be set");
+        }
+        let name = env::var(GOTO_CRATE_NAME_ENV)
+            .map_err(|_| format_err!("crate name env var not found"))?;
+        let version = env::var(GOTO_CRATE_VERSION_ENV)
+            .map_err(|_| format_err!("crate version env var not found"))?;
 
-        f(&args.crate_)?;
+        env::set_current_dir(org_dir)?;
+        f(&ReviewCrateSelector {
+            crate_: CrateSelector::new(Some(name), Some(Version::parse(&version)?), true),
+            diff: None,
+        })?;
+    } else {
+        let mut sel = None;
+        if args.crate_.name.is_none() {
+            if let Some(latest) = local_for_review.and_then(|l| l.latest_review_activity()) {
+                if args
+                    .diff
+                    .as_ref()
+                    .is_none_or(|new_base| new_base == &latest.diff_base)
+                {
+                    sel = Some(ReviewCrateSelector {
+                        diff: latest.diff_base.is_some().then_some(latest.diff_base),
+                        crate_: CrateSelector::new(
+                            Some(latest.name),
+                            Some(latest.version),
+                            args.crate_.unrelated,
+                        )
+                        .auto_unrelated()?,
+                    });
+                }
+            }
+        };
+        let sel = sel.as_ref().unwrap_or(args);
+        sel.crate_.ensure_name_given()?;
+        f(sel)?;
     }
     Ok(())
 }
 
+#[cfg(feature = "geiger")]
 pub fn is_file_with_ext(entry: &walkdir::DirEntry, file_ext: &str) -> bool {
     if !entry.file_type().is_file() {
         return false;
@@ -637,6 +668,7 @@ pub fn is_file_with_ext(entry: &walkdir::DirEntry, file_ext: &str) -> bool {
         .map_or(false, |ext| ext.to_string_lossy().as_ref() == file_ext)
 }
 
+#[cfg(feature = "geiger")]
 pub fn iter_rs_files_in_dir(dir: &Path) -> impl Iterator<Item = Result<PathBuf>> {
     let walker = walkdir::WalkDir::new(dir).into_iter();
     walker
@@ -651,7 +683,10 @@ pub fn iter_rs_files_in_dir(dir: &Path) -> impl Iterator<Item = Result<PathBuf>>
 }
 
 // Note: this function is very slow
+#[cfg(feature = "geiger")]
 pub fn get_geiger_count(path: &Path) -> Result<u64> {
+    use resiter::flat_map::FlatMap;
+
     let mut count = 0;
     for metrics in iter_rs_files_in_dir(path)
         .flat_map_ok(|path| geiger::find::find_unsafe_in_file(&path, geiger::IncludeTests::No))
@@ -661,10 +696,15 @@ pub fn get_geiger_count(path: &Path) -> Result<u64> {
             + counters.exprs.unsafe_
             + counters.item_impls.unsafe_
             + counters.item_traits.unsafe_
-            + counters.methods.unsafe_
+            + counters.methods.unsafe_;
     }
 
     Ok(count)
+}
+
+#[cfg(not(feature = "geiger"))]
+pub fn get_geiger_count(_: &Path) -> Result<u64> {
+    Err(anyhow::Error::msg("geiger feature is not enabled"))
 }
 
 /// Result of `run_command`
@@ -686,7 +726,7 @@ pub fn get_crate_digest_mismatches(
     version: &Version,
     digest: &crev_data::Digest,
 ) -> Vec<Package> {
-    db.get_package_reviews_for_package(PROJECT_SOURCE_CRATES_IO, Some(name), Some(version))
+    db.get_package_reviews_for_package(SOURCE_CRATES_IO, Some(name), Some(version))
         .filter(|review| review.package.digest != digest.as_slice())
         .cloned()
         .collect()
@@ -745,11 +785,7 @@ pub fn lookup_crates(query: &str, count: usize) -> Result<()> {
         .map(|crate_| CrateStats {
             name: crate_.name.clone(),
             downloads: crate_.downloads,
-            proof_count: db.get_package_review_count(
-                PROJECT_SOURCE_CRATES_IO,
-                Some(&crate_.name),
-                None,
-            ),
+            proof_count: db.get_package_review_count(SOURCE_CRATES_IO, Some(&crate_.name), None),
         })
         .collect();
 

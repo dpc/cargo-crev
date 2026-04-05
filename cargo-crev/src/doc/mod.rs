@@ -4,7 +4,7 @@
 /// and [Glossary](`self::user::glossary`) modules.
 ///
 /// Please be aware that all user documentation is
-/// a continous work in progress, and can be incorrect
+/// a continuous work in progress, and can be incorrect
 /// or stale.
 ///
 /// Writing high quality documentation is
@@ -12,7 +12,7 @@
 /// mistakes or ways to make improvements:
 ///
 /// 1. Open
-/// [user documentation source code directory](https://github.com/crev-dev/cargo-crev/tree/master/cargo-crev/src/doc),
+/// [user documentation source code directory](https://github.com/crev-dev/cargo-crev/tree/main/cargo-crev/src/doc),
 /// 2. Open the affected file,
 /// 3. Use *Edit this file* function,
 /// 4. Modify the text,

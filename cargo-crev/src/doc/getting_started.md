@@ -41,7 +41,7 @@ projects' dependencies.
 Crev is
 [language-independent](https://github.com/crev-dev/crev/#implementations), but
 the primary implementation is [`cargo
-crev`](https://github.com/crev-dev/cargo-crev/tree/master/cargo-crev) for
+crev`](https://github.com/crev-dev/cargo-crev/tree/main/cargo-crev) for
 Rust/[Cargo](https://doc.rust-lang.org/book/ch01-03-hello-cargo.html) crates.
 
 > This project and documentation is a work in progress. If anything is missing,
@@ -213,7 +213,7 @@ comment: ""
 
 You can edit it to customize the relationship. Editing the proof is modeled
 after editing a commit message through `git commit`. As you can see [helpful
-documentation](https://github.com/crev-dev/cargo-crev/blob/master/crev-lib/rc/doc/editing-trust.md)
+documentation](https://github.com/crev-dev/cargo-crev/blob/main/crev-lib/rc/doc/editing-trust.md)
 is available in the editor.
 
 ## Creating a `CrevID`
@@ -357,7 +357,7 @@ Example. VSCode users can run:
 $ cargo crev open <crate> --cmd "code --wait -n" --cmd-save
 ```
 
-`--cmd-save` will make `crev` remember the `--cmd` paramter in the future, so it
+`--cmd-save` will make `crev` remember the `--cmd` parameter in the future, so it
 does not have to be repeated every time. The exact `--cmd` to use for each IDE
 can vary, and you can ask for help in figuring it out on the `crev`'s gitter
 channel. You can change the command later with `cargo crev config edit`.
@@ -396,7 +396,7 @@ comment: ""
 # and trustworthiness.
 #
 # Your Proofs are cryptographically signed and will circulate in the ecosystem.
-# While there is no explicit or implicity legal responsibiltity attached to
+# While there is no explicit or implicitly legal responsibiltity attached to
 # using `crev` system, other people will most probably use it to judge you,
 # your other work, etc.
 #
@@ -408,7 +408,7 @@ comment: ""
 
 Again, a helpful comment section documents the basic guidelines of *review
 proof*, read it
-[here](https://github.com/crev-dev/cargo-crev/blob/master/crev-lib/rc/doc/editing-package-review.md).
+[here](https://github.com/crev-dev/cargo-crev/blob/main/crev-lib/rc/doc/editing-package-review.md).
 
 The most important part is: just be truthful.
 

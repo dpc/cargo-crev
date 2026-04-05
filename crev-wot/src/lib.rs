@@ -12,11 +12,18 @@
 //!
 //! `crev-wot` is just an initial, reference implementation, and might
 //! evolve, be replaced or become just one of many available implementations.
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+
 use chrono::{self, offset::Utc, DateTime};
 use crev_data::{
     self,
     proof::{self, review, trust::TrustLevel, CommonOps, Content},
-    Digest, Id, Level, Url, Version,
+    Digest, Id, Level, RegistrySource, Url, Version,
 };
 use default::default;
 use log::debug;
@@ -25,9 +32,8 @@ use std::{
     sync,
 };
 
-mod trust_set;
-
-pub use trust_set::*;
+pub mod trust_set;
+pub use trust_set::TrustSet;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -105,7 +111,7 @@ impl From<proof::Trust> for TimestampedTrustLevel {
     }
 }
 
-impl<'a, T: proof::WithReview + Content + CommonOps> From<&'a T> for TimestampedReview {
+impl<T: proof::WithReview + Content + CommonOps> From<&T> for TimestampedReview {
     fn from(review: &T) -> Self {
         TimestampedReview {
             value: review.review().clone(),
@@ -175,7 +181,9 @@ impl From<&review::Package> for PkgReviewId {
     }
 }
 
-pub type Source = String;
+/// Just a `String` version of `RegistrySource`, almost always `"https://crates.io"`.
+pub type RegistrySourceOwned = String;
+/// Crate name
 pub type Name = String;
 
 /// Alternatives relationship
@@ -230,6 +238,7 @@ impl AlternativesData {
 }
 
 pub type TimestampedTrustDetails = Timestamped<TrustDetails>;
+
 #[derive(Debug, Clone)]
 pub struct TrustDetails {
     level: TrustLevel,
@@ -276,8 +285,10 @@ pub struct ProofDB {
     proof_digest_by_pkg_review_id: HashMap<PkgVersionReviewId, TimestampedDigest>,
 
     // pkg_review_id by package information, nicely grouped
-    package_reviews:
-        BTreeMap<Source, BTreeMap<Name, BTreeMap<Version, HashSet<PkgVersionReviewId>>>>,
+    package_reviews: BTreeMap<
+        RegistrySourceOwned,
+        BTreeMap<Name, BTreeMap<Version, HashSet<PkgVersionReviewId>>>,
+    >,
 
     package_flags: HashMap<proof::PackageId, HashMap<Id, TimestampedFlags>>,
 
@@ -323,6 +334,7 @@ impl Default for ProofDB {
     }
 }
 
+/// Result of `get_open_issues_for_version`
 #[derive(Default, Debug)]
 pub struct IssueDetails {
     pub severity: Level,
@@ -333,12 +345,13 @@ pub struct IssueDetails {
 }
 
 impl ProofDB {
+    /// Use `Local::load_db()` to populate it
     #[must_use]
     pub fn new() -> Self {
         default()
     }
 
-    fn get_derived_alternatives<'s>(&'s self) -> sync::RwLockReadGuard<'s, AlternativesData> {
+    fn get_derived_alternatives(&self) -> sync::RwLockReadGuard<'_, AlternativesData> {
         {
             let read = self.derived_alternatives.read().expect("lock to work");
 
@@ -367,10 +380,10 @@ impl ProofDB {
         self.derived_alternatives.read().expect("lock to work")
     }
 
-    pub fn get_pkg_alternatives_by_author<'s, 'a>(
-        &'s self,
-        from: &'a Id,
-        pkg_id: &'a proof::PackageId,
+    pub fn get_pkg_alternatives_by_author(
+        &self,
+        from: &Id,
+        pkg_id: &proof::PackageId,
     ) -> HashSet<proof::PackageId> {
         let from = from.clone();
 
@@ -385,9 +398,9 @@ impl ProofDB {
             .collect()
     }
 
-    pub fn get_pkg_alternatives<'s, 'a>(
-        &'s self,
-        pkg_id: &'a proof::PackageId,
+    pub fn get_pkg_alternatives(
+        &self,
+        pkg_id: &proof::PackageId,
     ) -> HashSet<(Id, proof::PackageId)> {
         let alternatives = self.get_derived_alternatives();
 
@@ -400,10 +413,10 @@ impl ProofDB {
             .collect()
     }
 
-    pub fn get_pkg_flags_by_author<'s, 'a>(
+    pub fn get_pkg_flags_by_author<'s>(
         &'s self,
-        from: &'a Id,
-        pkg_id: &'a proof::PackageId,
+        from: &Id,
+        pkg_id: &proof::PackageId,
     ) -> Option<&'s proof::Flags> {
         let from = from.clone();
         self.package_flags
@@ -412,10 +425,10 @@ impl ProofDB {
             .map(move |timestampted| &timestampted.value)
     }
 
-    pub fn get_pkg_flags<'s, 'a>(
-        &'s self,
-        pkg_id: &'a proof::PackageId,
-    ) -> impl Iterator<Item = (&Id, &'s proof::Flags)> {
+    pub fn get_pkg_flags(
+        &self,
+        pkg_id: &proof::PackageId,
+    ) -> impl Iterator<Item = (&Id, &proof::Flags)> {
         self.package_flags
             .get(pkg_id)
             .into_iter()
@@ -423,9 +436,10 @@ impl ProofDB {
             .map(|(id, flags)| (id, &flags.value))
     }
 
-    pub fn get_pkg_reviews_for_source<'a, 'b>(
+    /// Use `"https://crates.io"` to get all crates-io reviews
+    pub fn get_pkg_reviews_for_source<'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'_>,
     ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.package_reviews
             .get(source)
@@ -441,7 +455,7 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_for_name<'a, 'b, 'c: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
     ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.package_reviews
@@ -458,7 +472,7 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_for_version<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         version: &'d Version,
     ) -> impl Iterator<Item = &'a proof::review::Package> {
@@ -476,7 +490,7 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_gte_version<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         version: &'d Version,
     ) -> impl Iterator<Item = &'a proof::review::Package> {
@@ -494,7 +508,7 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_lte_version<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         version: &'d Version,
     ) -> impl Iterator<Item = &'a proof::review::Package> {
@@ -530,18 +544,18 @@ impl ProofDB {
 
     pub fn get_pkg_review<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         version: &'d Version,
         id: &Id,
-    ) -> Option<&proof::review::Package> {
+    ) -> Option<&'a proof::review::Package> {
         self.get_pkg_reviews_for_version(source, name, version)
             .find(|pkg_review| pkg_review.from().id == *id)
     }
 
     pub fn get_advisories<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: Option<&'c str>,
         version: Option<&'d Version>,
     ) -> impl Iterator<Item = &'a proof::review::Package> + 'a {
@@ -559,12 +573,12 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_with_issues_for<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: Option<&'c str>,
         version: Option<&'c Version>,
         trust_set: &'d TrustSet,
         trust_level_required: TrustLevel,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         match (name, version) {
             (Some(name), Some(version)) => Box::new(self.get_pkg_reviews_with_issues_for_version(
                 source,
@@ -590,19 +604,19 @@ impl ProofDB {
 
     pub fn get_advisories_for_version<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         version: &'d Version,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.get_pkg_reviews_gte_version(source, name, version)
             .filter(move |review| review.is_advisory_for(version))
     }
 
     pub fn get_advisories_for_package<'a, 'b, 'c: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.package_reviews
             .get(source)
             .into_iter()
@@ -623,7 +637,7 @@ impl ProofDB {
 
     pub fn get_advisories_for_source(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
     ) -> impl Iterator<Item = &proof::review::Package> {
         self.get_pkg_reviews_for_source(source)
             .filter(|review| !review.advisories.is_empty())
@@ -639,7 +653,7 @@ impl ProofDB {
     /// of at least given `trust_level_required`.
     pub fn get_open_issues_for_version(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         queried_version: &Version,
         trust_set: &TrustSet,
@@ -648,7 +662,7 @@ impl ProofDB {
         // This is one of the most complicated calculations in whole crev. I hate this code
         // already, and I have barely put it together.
 
-        // Here we track all the reported isue by issue id
+        // Here we track all the reported issue by issue id
         let mut issue_reports_by_id: HashMap<String, IssueDetails> = HashMap::new();
 
         // First we go through all the reports in previous versions with `issues` fields and collect these.
@@ -712,7 +726,7 @@ impl ProofDB {
 
             // Remove the reports that are already fixed
             for id in &advisory.ids {
-                if let Some(mut issue_marker) = issue_reports_by_id.get_mut(id) {
+                if let Some(issue_marker) = issue_reports_by_id.get_mut(id) {
                     let issues = std::mem::take(&mut issue_marker.issues);
                     issue_marker.issues = issues
                         .into_iter()
@@ -744,12 +758,12 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_with_issues_for_version<'a, 'b, 'c: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         queried_version: &'c Version,
         trust_set: &'c TrustSet,
         trust_level_required: TrustLevel,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.get_pkg_reviews_with_issues_for_name(source, name, trust_set, trust_level_required)
             .filter(move |review| {
                 !review.issues.is_empty()
@@ -764,11 +778,11 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_with_issues_for_name<'a, 'b, 'c: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: &'c str,
         trust_set: &'c TrustSet,
         trust_level_required: TrustLevel,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.get_pkg_reviews_for_name(source, name)
             .filter(move |review| {
                 let effective = trust_set.get_effective_trust_level(&review.from().id);
@@ -779,10 +793,10 @@ impl ProofDB {
 
     pub fn get_pkg_reviews_with_issues_for_source<'a, 'b, 'c: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         trust_set: &'c TrustSet,
         trust_level_required: TrustLevel,
-    ) -> impl Iterator<Item = &proof::review::Package> {
+    ) -> impl Iterator<Item = &'a proof::review::Package> {
         self.get_pkg_reviews_for_source(source)
             .filter(move |review| {
                 let effective = trust_set.get_effective_trust_level(&review.from().id);
@@ -801,9 +815,9 @@ impl ProofDB {
             .fold(0, |count, (_id, set)| count + set.len())
     }
 
-    fn add_code_review(&mut self, review: &review::Code, fetched_from: FetchSource) {
+    fn add_code_review(&mut self, review: &review::Code, fetched_from: &FetchSource) {
         let from = &review.from();
-        self.record_url_from_from_field(&review.date_utc(), from, &fetched_from);
+        self.record_url_from_from_field(&review.date_utc(), from, fetched_from);
         for _file in &review.files {
             // not implemented right now; just ignore
         }
@@ -811,21 +825,17 @@ impl ProofDB {
 
     fn add_package_review(
         &mut self,
-        review: &review::Package,
+        review: review::Package,
         signature: &str,
-        fetched_from: FetchSource,
+        fetched_from: &FetchSource,
         proof_digest: proof::Digest,
     ) {
         self.insertion_counter += 1;
 
-        let from = &review.from();
-        self.record_url_from_from_field(&review.date_utc(), from, &fetched_from);
+        let from = review.from();
+        self.record_url_from_from_field(&review.date_utc(), from, fetched_from);
 
-        self.package_review_by_signature
-            .entry(signature.to_owned())
-            .or_insert_with(|| review.clone());
-
-        let pkg_review_id = PkgVersionReviewId::from(review);
+        let pkg_review_id = PkgVersionReviewId::from(&review);
         let timestamp_signature = TimestampedSignature::from((review.date(), signature.to_owned()));
         let timestamp_proof_digest = TimestampedDigest::from((review.date(), proof_digest));
         let timestamp_flags = TimestampedFlags::from((review.date(), review.flags.clone()));
@@ -874,11 +884,15 @@ impl ProofDB {
             .entry(review.from().id.clone())
             .and_modify(|f| f.update_to_more_recent(&timestamp_flags))
             .or_insert_with(|| timestamp_flags);
+
+        self.package_review_by_signature
+            .entry(signature.to_owned())
+            .or_insert(review);
     }
 
     pub fn get_package_review_count(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: Option<&str>,
         version: Option<&Version>,
     ) -> usize {
@@ -888,7 +902,7 @@ impl ProofDB {
 
     pub fn get_package_reviews_for_package<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: Option<&'c str>,
         version: Option<&'d Version>,
     ) -> impl Iterator<Item = &'a proof::review::Package> + 'a {
@@ -905,7 +919,7 @@ impl ProofDB {
 
     pub fn get_package_reviews_for_package_sorted<'a, 'b, 'c: 'a, 'd: 'a>(
         &'a self,
-        source: &'b str,
+        source: RegistrySource<'b>,
         name: Option<&'c str>,
         version: Option<&'d Version>,
     ) -> Vec<proof::review::Package> {
@@ -957,22 +971,22 @@ impl ProofDB {
 
         self.trust_id_to_id
             .entry(from.clone())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .entry(to.clone())
             .and_modify(|e| e.update_to_more_recent(&td))
             .or_insert_with(|| td);
 
         self.reverse_trust_id_to_id
             .entry(to.clone())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .entry(from.clone())
             .and_modify(|e| e.update_to_more_recent(&tl))
             .or_insert_with(|| tl);
     }
 
-    fn add_trust(&mut self, trust: &proof::Trust, signature: &str, fetched_from: FetchSource) {
+    fn add_trust(&mut self, trust: &proof::Trust, signature: &str, fetched_from: &FetchSource) {
         let from = &trust.from();
-        self.record_url_from_from_field(&trust.date_utc(), from, &fetched_from);
+        self.record_url_from_from_field(&trust.date_utc(), from, fetched_from);
         for to in &trust.ids {
             self.add_trust_raw(&from.id, &to.id, trust.date_utc(), trust, signature);
         }
@@ -980,7 +994,7 @@ impl ProofDB {
             // Others should not be making verified claims about this URL,
             // regardless of where these proofs were fetched from, because only
             // owner of the Id is authoritative.
-            self.record_url_from_to_field(&trust.date_utc(), to)
+            self.record_url_from_to_field(&trust.date_utc(), to);
         }
     }
 
@@ -992,6 +1006,7 @@ impl ProofDB {
             .collect()
     }
 
+    /// Only for direct relationship. See `calculate_trust_set`.
     pub fn get_reverse_trust_for<'id, 's: 'id>(
         &'s self,
         id: &'id Id,
@@ -1031,9 +1046,7 @@ impl ProofDB {
             .get(digest.as_slice())
             .into_iter()
             .flat_map(move |unique_reviews| {
-                unique_reviews
-                    .iter()
-                    .map(move |(_unique_review, signature)| {
+                unique_reviews.values().map(|signature| {
                         self.package_review_by_signature[&signature.value].clone()
                     })
             })
@@ -1070,7 +1083,7 @@ impl ProofDB {
             let fetch_matches = match fetched_from {
                 FetchSource::LocalUser => true,
                 FetchSource::Url(fetched_url) if **fetched_url == *url => true,
-                _ => false,
+                FetchSource::Url(_other) => false,
             };
             self.url_by_id_self_reported
                 .entry(from.id.clone())
@@ -1089,15 +1102,15 @@ impl ProofDB {
             .verify()
             .expect("All proofs were supposed to be valid here");
         match proof.kind() {
-            proof::CodeReview::KIND => self.add_code_review(&proof.parse_content()?, fetched_from),
+            proof::CodeReview::KIND => self.add_code_review(&proof.parse_content()?, &fetched_from),
             proof::PackageReview::KIND => self.add_package_review(
-                &proof.parse_content()?,
+                proof.parse_content()?,
                 proof.signature(),
-                fetched_from,
+                &fetched_from,
                 proof::Digest(*proof.digest()),
             ),
             proof::Trust::KIND => {
-                self.add_trust(&proof.parse_content()?, proof.signature(), fetched_from)
+                self.add_trust(&proof.parse_content()?, proof.signature(), &fetched_from);
             }
             other => return Err(Error::UnknownProofType(other.into())),
         }
@@ -1109,7 +1122,7 @@ impl ProofDB {
         for (proof, fetch_source) in i {
             // ignore errors
             if let Err(e) = self.add_proof(&proof, fetch_source) {
-                debug!("Ignoring proof: {}", e);
+                debug!("Ignoring proof: {e}");
             }
         }
     }
@@ -1122,6 +1135,7 @@ impl ProofDB {
             .flatten()
     }
 
+    /// Only for direct relationship. See `calculate_trust_set`.
     pub fn get_trust_proof_between(&self, from: &Id, to: &Id) -> Option<&proof::Trust> {
         self.ids_to_trust_proof_signatures
             .get(&(from.clone(), to.clone()))
@@ -1148,6 +1162,7 @@ impl ProofDB {
             })
     }
 
+    /// How much you trust others
     pub fn calculate_trust_set(&self, for_id: &Id, params: &TrustDistanceParams) -> TrustSet {
         TrustSet::from(self, for_id, params)
     }
@@ -1211,7 +1226,7 @@ impl<'a> UrlOfId<'a> {
     pub fn any_unverified(self) -> Option<&'a Url> {
         match self {
             Self::FromSelfVerified(url) | Self::FromSelf(url) | Self::FromOthers(url) => Some(url),
-            _ => None,
+            Self::None => None,
         }
     }
 }
@@ -1238,15 +1253,15 @@ impl TrustDistanceParams {
         }
     }
 
-    fn distance_by_level(&self, level: TrustLevel) -> Option<u64> {
+    fn distance_by_level(&self, level: TrustLevel) -> u64 {
         use crev_data::proof::trust::TrustLevel::*;
-        Some(match level {
+        match level {
             Distrust => self.distrust_distance,
             None => self.none_trust_distance,
             Low => self.low_trust_distance,
             Medium => self.medium_trust_distance,
             High => self.high_trust_distance,
-        })
+        }
     }
 }
 

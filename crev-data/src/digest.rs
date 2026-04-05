@@ -1,5 +1,6 @@
 use std::fmt;
 
+/// This is a cryptographic hash of everything in a crate, which reliably identifies its exact source code
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct Digest([u8; 32]);
 
@@ -15,16 +16,6 @@ impl Digest {
         &self.0
     }
 
-    #[must_use]
-    pub fn from_vec(vec: Vec<u8>) -> Option<Self> {
-        if vec.len() == 32 {
-            let mut out = [0; 32];
-            out.copy_from_slice(&vec);
-            Some(Self(out))
-        } else {
-            None
-        }
-    }
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() == 32 {

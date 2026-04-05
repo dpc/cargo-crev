@@ -1,4 +1,8 @@
 //! Bunch of code that is auxiliary and common for all `crev`
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_closure_for_method_calls)]
 
 pub mod blake2b256;
 pub mod fs;
@@ -6,6 +10,9 @@ pub mod rand;
 pub mod serde;
 
 pub use crate::blake2b256::Blake2b256;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use blake2::{digest::FixedOutput, Digest};
 use std::{
     collections::HashSet,
@@ -48,11 +55,11 @@ pub fn blake2b256sum_file(path: &Path) -> io::Result<[u8; 32]> {
 }
 
 pub fn base64_decode<T: ?Sized + AsRef<[u8]>>(input: &T) -> Result<Vec<u8>, base64::DecodeError> {
-    base64::decode_config(input, base64::URL_SAFE_NO_PAD)
+    URL_SAFE_NO_PAD.decode(input)
 }
 
 pub fn base64_encode<T: ?Sized + AsRef<[u8]>>(input: &T) -> String {
-    base64::encode_config(input, base64::URL_SAFE_NO_PAD)
+    URL_SAFE_NO_PAD.encode(input)
 }
 
 /// Takes a name and converts it to something safe for use in paths etc.
@@ -227,8 +234,7 @@ pub fn run_with_shell_cmd(cmd: &OsStr, arg: Option<&Path>) -> io::Result<std::pr
 pub fn run_with_shell_cmd_capture_stdout(cmd: &OsStr, arg: Option<&Path>) -> io::Result<Vec<u8>> {
     let output = run_with_shell_cmd_custom(cmd, arg, true)?;
     if !output.status.success() {
-        return Err(std::io::Error::new(
-            io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "command failed with non-zero status",
         ));
     }

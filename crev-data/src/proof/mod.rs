@@ -29,7 +29,14 @@ pub type DateUtc = chrono::DateTime<Utc>;
 #[derive(Debug, Clone)]
 pub struct Digest(pub [u8; 32]);
 
-/// Serialized Proof
+impl Digest {
+    #[must_use]
+    pub fn to_base64(&self) -> String {
+        crev_common::base64_encode(&self.0)
+    }
+}
+
+/// Serialized Proof (crate review or trust of someone)
 ///
 /// A signed proof containing some signed `Content`
 #[derive(Debug, Clone)]
@@ -40,7 +47,7 @@ pub struct Proof {
     /// Signature over the body
     signature: String,
 
-    /// Common informations that should be in any  proof
+    /// Common information that should be in any  proof
     common_content: Common,
 
     /// Digest (blake2b256)
@@ -49,6 +56,7 @@ pub struct Proof {
 }
 
 impl Proof {
+    /// Assumes the body has been properly signed already
     pub fn from_parts(body: String, signature: String) -> Result<Self> {
         let common_content: Common = serde_yaml::from_str(&body).map_err(ParseError::Proof)?;
         if common_content.kind.is_none() {
@@ -64,6 +72,7 @@ impl Proof {
         })
     }
 
+    /// For back-compat, ignore it
     pub fn from_legacy_parts(body: String, signature: String, type_name: String) -> Result<Self> {
         #[allow(deprecated)]
         let mut legacy_common_content: content::Common =
@@ -82,21 +91,26 @@ impl Proof {
             digest,
         })
     }
+
+    /// YAML in it
     #[must_use]
     pub fn body(&self) -> &str {
         self.body.as_str()
     }
 
+    /// Signature attached to it
     #[must_use]
     pub fn signature(&self) -> &str {
         self.signature.as_str()
     }
 
+    /// Hash of the body
     #[must_use]
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
     }
 
+    /// Read the YAML with serde, you should already know which type to expect from context
     pub fn parse_content<T: ContentDeserialize>(&self) -> std::result::Result<T, Error> {
         T::deserialize_from(self.body.as_bytes())
     }
@@ -200,6 +214,7 @@ impl fmt::Display for Proof {
 }
 
 impl Proof {
+    /// Read from a file (uses buffering)
     pub fn parse_from(reader: impl io::Read) -> Result<Vec<Self>> {
         let reader = std::io::BufReader::new(reader);
 
@@ -310,6 +325,7 @@ impl Proof {
         state.finish()
     }
 
+    /// Checks the signature
     pub fn verify(&self) -> Result<()> {
         let pubkey = &self.from().id;
         pubkey.verify_signature(self.body.as_bytes(), self.signature())?;

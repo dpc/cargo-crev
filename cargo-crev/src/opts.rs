@@ -8,7 +8,7 @@ use crate::term::Term;
 
 #[derive(Debug, StructOpt, Clone, Default)]
 pub struct CrateSelector {
-    /// This crate is not neccesarily a dependency of the current cargo project
+    /// This crate is not necessarily a dependency of the current cargo project
     #[structopt(long = "unrelated", short = "u")]
     pub unrelated: bool,
 
@@ -73,6 +73,15 @@ impl CrateSelector {
         }
 
         Ok(())
+    }
+}
+
+impl ReviewCrateSelector {
+    pub fn auto_unrelated(self) -> Result<Self> {
+        Ok(Self {
+            diff: self.diff,
+            crate_: self.crate_.auto_unrelated()?,
+        })
     }
 }
 
@@ -204,7 +213,7 @@ pub struct Diff {
     #[structopt(long = "dst")]
     pub dst: Option<Version>,
 
-    /// This crate is not neccesarily a dependency of the current cargo project
+    /// This crate is not necessarily a dependency of the current cargo project
     #[structopt(long = "unrelated", short = "u")]
     pub unrelated: bool,
 
@@ -406,6 +415,8 @@ pub struct CrateVerify {
     pub columns: CrateVerifyColumns,
 
     #[structopt(long = "interactive", short = "i")]
+    #[allow(unused)]
+    /// No-op
     pub interactive: bool,
 
     #[structopt(long = "skip-verified")]
@@ -555,7 +566,7 @@ pub struct RepoQueryIssue {
 #[derive(Debug, StructOpt, Clone)]
 pub struct CrateDir {
     #[structopt(flatten)]
-    pub common: ReviewOrGotoCommon,
+    pub common: ReviewCrateSelector,
 }
 
 #[derive(Debug, StructOpt, Clone)]
@@ -592,9 +603,14 @@ pub struct RepoGit {
 }
 
 #[derive(Debug, StructOpt, Clone)]
-pub struct ReviewOrGotoCommon {
+pub struct ReviewCrateSelector {
     #[structopt(flatten)]
     pub crate_: CrateSelector,
+
+    /// Review the delta since the given version
+    #[structopt(long = "diff", name = "base-version")]
+    #[allow(clippy::option_option)]
+    pub diff: Option<Option<Version>>,
 }
 
 #[derive(Debug, StructOpt, Clone)]
@@ -608,7 +624,7 @@ pub struct CrateOpen {
     pub cmd_save: bool,
 
     #[structopt(flatten)]
-    pub common: ReviewOrGotoCommon,
+    pub common: ReviewCrateSelector,
 }
 
 #[derive(Debug, StructOpt, Clone)]
@@ -633,7 +649,7 @@ pub struct CommonProofCreate {
 #[derive(Debug, StructOpt, Clone)]
 pub struct CrateReview {
     #[structopt(flatten)]
-    pub common: ReviewOrGotoCommon,
+    pub common: ReviewCrateSelector,
 
     #[structopt(flatten)]
     pub common_proof_create: CommonProofCreate,
@@ -660,11 +676,6 @@ pub struct CrateReview {
     #[structopt(long = "overrides")]
     /// Enable overrides suggestions
     pub overrides: bool,
-
-    /// Review the delta since the given version
-    #[structopt(long = "diff", name = "base-version")]
-    #[allow(clippy::option_option)]
-    pub diff: Option<Option<Version>>,
 
     #[structopt(flatten)]
     pub cargo_opts: CargoOpts,
@@ -771,7 +782,7 @@ pub struct CrateVerifyFull {
 pub enum Crate {
     /// Start a shell in source directory of a crate under review
     #[structopt(name = "goto")]
-    Goto(ReviewOrGotoCommon),
+    Goto(CrateSelector),
 
     /// Open the source code of a crate
     #[structopt(name = "open")]
@@ -780,11 +791,11 @@ pub enum Crate {
     /// WIP: Expand the crate source using `cargo-expand` like functionality
     // https://github.com/dtolnay/cargo-expand/issues/11
     #[structopt(name = "expand")]
-    Expand(ReviewOrGotoCommon),
+    Expand(ReviewCrateSelector),
 
     /// Clean the source code directory of a crate (eg. after review)
     #[structopt(name = "clean")]
-    Clean(ReviewOrGotoCommon),
+    Clean(CrateSelector),
 
     /// Diff between two versions of a package
     #[structopt(name = "diff")]
@@ -872,6 +883,9 @@ pub struct ProofFind {
 
     #[structopt(name = "vers", long = "vers")]
     pub version: Option<Version>,
+
+    #[structopt(name = "git-rev", long = "git-rev")]
+    pub git_revision: Option<String>,
 
     /// Find a proof by a crev Id
     #[structopt(name = "author", long = "author")]
@@ -1000,9 +1014,11 @@ pub enum Command {
 
     /// Shortcut for `crate goto`
     #[structopt(name = "goto")]
-    Goto(ReviewOrGotoCommon),
+    Goto(CrateSelector),
 
     /// Shortcut for `crate open`
+    ///
+    /// Crev will remember the last crate you've opened and default `crev review` to the same crate.
     #[structopt(name = "open")]
     Open(CrateOpen),
 
@@ -1011,6 +1027,8 @@ pub enum Command {
     Publish,
 
     /// Shortcut for `crate review`
+    ///
+    /// You can omit crate name if you're called `open` recently.
     #[structopt(name = "review")]
     Review(CrateReview),
 

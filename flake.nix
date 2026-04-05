@@ -2,8 +2,8 @@
   description = "Cryptographically verifiable Code REviews";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.11";
-    crane.url = "github:ipetkov/crane";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    crane.url = "github:ipetkov/crane/v0.18.1";
     crane.inputs.nixpkgs.follows = "nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     fenix = {
@@ -30,13 +30,13 @@
           "rustc"
           "cargo"
           "clippy"
-          "rust-analysis"
           "rust-src"
-          "rustfmt"
           "llvm-tools-preview"
         ]);
 
-        craneLib = crane.lib.${system}.overrideToolchain fenix-toolchain;
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p:
+          fenix.packages.${system}.stable
+        );
 
         # filter source code at path `src` to include only the list of `modules`
         filterModules = modules: src:
@@ -136,7 +136,7 @@
         # file change
         pkg = { name ? null, dir, port ? 8000, extraDirs ? [ ] }: rec {
           package = craneLib.buildPackage (commonArgs // {
-            cargoArtifacts = workspaceDeps;
+            cargoArtifacts = workspaceDeps.cargoArtifacts;
 
             src = filterModules ([ dir ] ++ extraDirs) ./.;
 
@@ -163,13 +163,13 @@
 
         workspaceBuild = craneLib.cargoBuild (commonArgs // {
           pname = "workspace-build";
-          cargoArtifacts = workspaceDeps;
+          cargoArtifacts = workspaceDeps.cargoArtifacts;
           doCheck = false;
         });
 
         workspaceTest = craneLib.cargoBuild (commonArgs // {
           pname = "workspace-test";
-          cargoArtifacts = workspaceBuild;
+          cargoArtifacts = workspaceBuild.cargoArtifacts;
           doCheck = true;
         });
 
@@ -178,7 +178,7 @@
         # See: https://github.com/ipetkov/crane/issues/64
         workspaceClippy = craneLib.cargoBuild (commonArgs // {
           pname = "workspace-clippy";
-          cargoArtifacts = workspaceBuild;
+          cargoArtifacts = workspaceBuild.cargoArtifacts;
 
           cargoBuildCommand = "cargo clippy --profile release --no-deps --lib --bins --tests --examples --workspace -- --deny warnings";
           doInstallCargoArtifacts = false;
@@ -187,7 +187,7 @@
 
         workspaceDoc = craneLib.cargoBuild (commonArgs // {
           pname = "workspace-doc";
-          cargoArtifacts = workspaceBuild;
+          cargoArtifacts = workspaceBuild.cargoArtifacts;
           cargoBuildCommand = "env RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links' cargo doc --no-deps --document-private-items && cp -a target/doc $out";
           doCheck = false;
         });
@@ -230,7 +230,7 @@
 
                 pkgs.nixpkgs-fmt
                 pkgs.shellcheck
-                pkgs.rnix-lsp
+                pkgs.nil
                 pkgs.nodePackages.bash-language-server
               ]);
             RUST_SRC_PATH = "${fenix-channel.rust-src}/lib/rustlib/src/rust/library";
@@ -255,7 +255,6 @@
           # of stuff to avoid building and caching things we don't need
           lint = pkgs.mkShell {
             nativeBuildInputs = [
-              pkgs.rustfmt
               pkgs.nixpkgs-fmt
               pkgs.shellcheck
               pkgs.git

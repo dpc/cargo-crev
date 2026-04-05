@@ -99,7 +99,7 @@ fn proofdb_distance() -> Result<()> {
 // should be visible in all the user-facing stats, listings
 // and counts.
 #[test]
-fn overwritting_reviews() -> Result<()> {
+fn overwriting_reviews() -> Result<()> {
     let url = FetchSource::Url(Arc::new(Url::new_git("https://a")));
     let a = UnlockedId::generate_for_git_url("https://a");
     let digest = [0; 32];
@@ -128,7 +128,7 @@ fn overwritting_reviews() -> Result<()> {
         .create_package_review_proof(package.clone(), default(), vec![], "b".into())?
         .sign_by(&a)?;
 
-    for order in vec![vec![proof1.clone(), proof2.clone()], vec![proof2, proof1]] {
+    for order in [vec![proof1.clone(), proof2.clone()], vec![proof2, proof1]] {
         let mut trustdb = ProofDB::new();
         trustdb.import_from_iter(order.into_iter().map(|x| (x, url.clone())));
         assert_eq!(

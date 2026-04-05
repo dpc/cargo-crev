@@ -1,15 +1,18 @@
 //! `cargo-crev` - `crev` ecosystem fronted for Rusti (`cargo` integration)
 //!
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::redundant_closure_for_method_calls)]
 #![type_length_limit = "1932159"]
 #![cfg_attr(
     feature = "documentation",
     doc = "See [user documentation module](./doc/user/index.html)."
 )]
 use crate::prelude::*;
-use crev_data::{proof::ContentExt, UnlockedId};
+use crev_data::{proof::ContentExt, UnlockedId, SOURCE_CRATES_IO};
 use crev_lib::id::LockedId;
-
 use crev_lib::{self, local::Local};
+use log::info;
+use opts::ReviewCrateSelector;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -38,9 +41,16 @@ mod term;
 mod tokei;
 mod wot;
 
-use crate::{repo::*, review::*, shared::*};
+#[cfg(target_os = "macos")]
+mod creds;
+
+use crate::{
+    repo::Repo,
+    review::{create_review_proof, list_reviews},
+    shared::*,
+};
 use crev_data::{proof, Id, TrustLevel};
-use crev_lib::TrustProofType;
+use crev_lib::{TrustProofType, Warning};
 use crev_wot::{PkgVersionReviewId, ProofDB, TrustSet, UrlOfId};
 use log::debug;
 
@@ -53,7 +63,10 @@ trait LocalExt {
 
 impl LocalExt for Local {
     fn run_git_verbose(&self, args: Vec<OsString>) -> Result<std::process::ExitStatus> {
-        match self.run_git(args) {
+        let mut warnings = Vec::new();
+        let res = self.run_git(args, &mut warnings);
+        Warning::log_all(&warnings);
+        match res {
             Ok(o) => Ok(o),
             Err(crev_lib::Error::GitUrlNotConfigured) => {
                 bail!("Id has no public URL set. Run `cargo crev id set-url <your-public-git-proof-repo>` and try again. See https://github.com/crev-dev/cargo-crev/discussions for help.");
@@ -84,13 +97,13 @@ pub fn repo_publish() -> Result<()> {
     std::process::exit(status.code().unwrap_or(-159));
 }
 
-fn repo_update(args: opts::Update) -> Result<()> {
+fn repo_update(args: opts::Update, warnings: &mut Vec<Warning>) -> Result<()> {
     let local = Local::auto_open()?;
     let status = local.run_git_verbose(vec!["pull".into(), "--rebase".into()])?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(-159));
     }
-    local.fetch_trusted(opts::TrustDistanceParams::default().into(), None)?;
+    local.fetch_trusted(opts::TrustDistanceParams::default().into(), None, warnings)?;
     let repo = Repo::auto_open_cwd(args.cargo_opts)?;
     repo.update_counts()?;
     Ok(())
@@ -99,7 +112,7 @@ fn repo_update(args: opts::Update) -> Result<()> {
 pub fn proof_find(args: opts::ProofFind) -> Result<()> {
     let local = crev_lib::Local::auto_open()?;
     let db = local.load_db()?;
-    let mut iter = Box::new(db.get_pkg_reviews_for_source(PROJECT_SOURCE_CRATES_IO))
+    let mut iter = Box::new(db.get_pkg_reviews_for_source(SOURCE_CRATES_IO))
         as Box<dyn Iterator<Item = &proof::review::Package>>;
 
     if let Some(author) = args.author.as_ref() {
@@ -109,10 +122,22 @@ pub fn proof_find(args: opts::ProofFind) -> Result<()> {
 
     if let Some(crate_) = args.crate_.as_ref() {
         iter = Box::new(iter.filter(move |r| &r.package.id.id.name == crate_));
-        if let Some(version) = args.version.as_ref() {
-            iter = Box::new(iter.filter(move |r| &r.package.id.version == version));
-        }
     }
+
+    if let Some(version) = args.version.as_ref() {
+        iter = Box::new(iter.filter(move |r| &r.package.id.version == version));
+    }
+
+    if let Some(git_revision) = args.git_revision.as_ref() {
+        iter = Box::new(iter.filter(move |r|
+            r.package.revision_type == proof::default_revision_type()
+            && (
+                git_revision.is_empty() && &r.package.revision == git_revision
+                || !git_revision.is_empty() && r.package.revision.starts_with(git_revision)
+            )
+        ));
+    }
+
     for review in iter {
         println!("---\n{review}");
     }
@@ -124,7 +149,7 @@ pub fn proof_reissue(args: opts::ProofReissue) -> Result<()> {
     let local = crev_lib::Local::auto_open()?;
     let db = local.load_db()?;
 
-    let mut iter = Box::new(db.get_pkg_reviews_for_source(PROJECT_SOURCE_CRATES_IO))
+    let mut iter = Box::new(db.get_pkg_reviews_for_source(SOURCE_CRATES_IO))
         as Box<dyn Iterator<Item = &proof::review::Package>>;
 
     let author_id = crev_data::id::Id::crevid_from_str(&args.author)?;
@@ -142,7 +167,7 @@ pub fn proof_reissue(args: opts::ProofReissue) -> Result<()> {
     for orig_review in iter {
         if !args.skip_reissue_check {
             // check if already reissued this review previously to prevent bloating the db
-            if db.get_pkg_reviews_for_source(PROJECT_SOURCE_CRATES_IO).any(
+            if db.get_pkg_reviews_for_source(SOURCE_CRATES_IO).any(
                 |review: &proof::review::Package| {
                     review.common.from.id == sign_id.id.id && review.package == orig_review.package
                 },
@@ -209,10 +234,10 @@ pub fn proof_reissue(args: opts::ProofReissue) -> Result<()> {
     Ok(())
 }
 
-fn crate_review(args: opts::CrateReview) -> Result<()> {
+fn crate_review(args: &opts::CrateReview, default_trust_type: TrustProofType) -> Result<()> {
     let local = ensure_crev_id_exists_or_make_one()?;
 
-    handle_goto_mode_command(&args.common, |sel| {
+    handle_goto_mode_command(&args.common, Some(&local), |sel| {
         let is_advisory =
             args.advisory || args.affected.is_some() || (!args.issue && args.severity.is_some());
         create_review_proof(
@@ -235,10 +260,9 @@ fn crate_review(args: opts::CrateReview) -> Result<()> {
             if is_advisory || args.issue {
                 TrustProofType::Distrust
             } else {
-                TrustProofType::Trust
+                default_trust_type
             },
             &args.common_proof_create,
-            &args.diff,
             args.skip_activity_check || is_advisory || args.issue,
             args.overrides,
             args.cargo_opts.clone(),
@@ -246,7 +270,7 @@ fn crate_review(args: opts::CrateReview) -> Result<()> {
         let has_public_url = local
             .read_current_locked_id()
             .ok()
-            .map_or(false, |l| l.to_public_id().url.is_some());
+            .is_some_and(|l| l.to_public_id().url.is_some());
         if !has_public_url {
             eprintln!("Your review is not shared yet. You need to set up a proof repository.");
             eprintln!("Run `cargo crev publish` for more information.");
@@ -261,7 +285,7 @@ fn crate_review(args: opts::CrateReview) -> Result<()> {
 pub fn cargo_registry_to_crev_source_id(source_id: &cargo::core::SourceId) -> String {
     let s = source_id.as_url().to_string();
     if &s == "registry+https://github.com/rust-lang/crates.io-index" {
-        crate::PROJECT_SOURCE_CRATES_IO.into()
+        SOURCE_CRATES_IO.into()
     } else {
         s
     }
@@ -278,11 +302,7 @@ pub fn cargo_pkg_id_to_crev_pkg_id(id: &cargo::core::PackageId) -> proof::Packag
     }
 }
 
-fn print_ids<'a>(
-    ids: impl Iterator<Item = &'a Id>,
-    trust_set: &TrustSet,
-    db: &ProofDB,
-) -> Result<()> {
+fn print_ids<'a>(ids: impl Iterator<Item = &'a Id>, trust_set: &TrustSet, db: &ProofDB) {
     for id in ids {
         let (status, url) = match db.lookup_url(id) {
             UrlOfId::None => ("", ""),
@@ -298,7 +318,6 @@ fn print_ids<'a>(
             url,
         );
     }
-    Ok(())
 }
 
 fn url_to_status_str<'a>(id_url: &UrlOfId<'a>) -> (&'static str, &'a str) {
@@ -310,11 +329,7 @@ fn url_to_status_str<'a>(id_url: &UrlOfId<'a>) -> (&'static str, &'a str) {
     }
 }
 
-fn print_mvp_ids<'a>(
-    ids: impl Iterator<Item = (&'a Id, u64)>,
-    trust_set: &TrustSet,
-    db: &ProofDB,
-) -> Result<()> {
+fn print_mvp_ids<'a>(ids: impl Iterator<Item = (&'a Id, u64)>, trust_set: &TrustSet, db: &ProofDB) {
     for (id, count) in ids {
         let (status, url) = url_to_status_str(&db.lookup_url(id));
         println!(
@@ -326,7 +341,6 @@ fn print_mvp_ids<'a>(
             url,
         );
     }
-    Ok(())
 }
 
 fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
@@ -346,7 +360,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
             }
             opts::Id::Switch(args) => {
                 let local = Local::auto_open()?;
-                local.switch_id(&args.id)?
+                local.switch_id(&args.id)?;
             }
             opts::Id::Passwd => {
                 current_id_change_passphrase()?;
@@ -357,7 +371,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                     .read_current_locked_id_opt()?
                     .map(|id| id.to_public_id());
                 for id in local.get_current_user_public_ids()? {
-                    let is_current = current.as_ref().map_or(false, |c| c.id == id.id);
+                    let is_current = current.as_ref().is_some_and(|c| c.id == id.id);
                     println!(
                         "{} {}{}",
                         id.id,
@@ -375,7 +389,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                         | crev_lib::Error::UserConfigNotInitialized,
                     ) => {
                         eprintln!("set-url requires a CrevID set up, so we'll set up one now.");
-                        generate_new_id_interactively(Some(&args.url), args.use_https_push)?
+                        generate_new_id_interactively(Some(&args.url), args.use_https_push)?;
                     }
                     res => res?,
                 }
@@ -398,7 +412,9 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                     .expect("A public id must have an associated URL");
                 let proof_dir_path = local.get_proofs_dir_path_for_url(url)?;
                 if !proof_dir_path.exists() {
-                    local.clone_proof_dir_from_git(&url.url, false)?;
+                    let mut warnings = Vec::new();
+                    local.clone_proof_dir_from_git(&url.url, false, &mut warnings)?;
+                    Warning::log_all(&warnings);
                 }
             }
             opts::Id::Trust(args) => {
@@ -436,7 +452,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                         let db = local.load_db()?;
                         let trust_set = db.calculate_trust_set(&id.id, &trust_params.into());
 
-                        print_ids(Some(id.id).as_ref().into_iter(), &trust_set, &db)?;
+                        print_ids(Some(id.id).as_ref().into_iter(), &trust_set, &db);
                     }
                 }
                 opts::IdQuery::Own { trust_params } => {
@@ -452,7 +468,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                                 .map(|public_id| &public_id.id),
                             &trust_set,
                             &db,
-                        )?;
+                        );
                     }
                 }
                 opts::IdQuery::Trusted {
@@ -472,7 +488,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                         }),
                         &trust_set,
                         &db,
-                    )?;
+                    );
                 }
                 // TODO: move to crev-lib
                 opts::IdQuery::All {
@@ -498,7 +514,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                         .collect::<Vec<_>>();
                     tmp.sort();
 
-                    print_ids(tmp.iter().map(|(_, _, id)| id), &trust_set, &db)?;
+                    print_ids(tmp.iter().map(|(_, _, id)| id), &trust_set, &db);
                 }
             },
         },
@@ -543,8 +559,18 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                 args.level.is_none(),
                 args.overrides,
             )?;
+            let mut warnings = Vec::new();
             // Make sure we have reviews for the new Ids we're trusting
-            local.fetch_new_trusted(Default::default(), None)?;
+            local.fetch_new_trusted(Default::default(), None, &mut warnings)?;
+
+            // only warn about the new ids, don't scare about old problems.
+            for w in &warnings {
+                if let Warning::IdUrlNotKnonw(id) = w {
+                    if ids.contains(id) {
+                        w.log();
+                    }
+                }
+            }
         }
         opts::Command::Crate(args) => match args {
             opts::Crate::Diff(args) => {
@@ -561,61 +587,34 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                 info::print_crate_info(crate_.auto_unrelated()?, opts, wot)?;
             }
             opts::Crate::Goto(args) => {
-                goto_crate_src(&args.crate_.auto_unrelated()?)?;
+                goto_crate_src(&args.auto_unrelated()?)?;
             }
             opts::Crate::Expand(args) => {
                 expand_crate_src(&args.crate_.auto_unrelated()?)?;
             }
             opts::Crate::Open(args) => {
-                handle_goto_mode_command(&args.common.clone(), |crate_| {
-                    crate_open(&crate_.clone().auto_unrelated()?, args.cmd, args.cmd_save)
+                handle_goto_mode_command(&args.common.clone(), None, |sel| {
+                    crate_open(&sel.clone().auto_unrelated()?, args.cmd, args.cmd_save)
                 })?;
             }
             opts::Crate::Clean(args) => {
-                if args.crate_.is_empty() && are_we_called_from_goto_shell().is_none() {
+                if args.is_empty() && are_we_called_from_goto_shell().is_none() {
                     clean_all_crates_with_digest_mismatch()?;
                 } else {
-                    handle_goto_mode_command(&args, clean_crate)?;
+                    handle_goto_mode_command(
+                        &ReviewCrateSelector {
+                            crate_: args.clone(),
+                            diff: None,
+                        },
+                        None,
+                        |sel| clean_crate(&sel.crate_),
+                    )?;
                 }
             }
             opts::Crate::Dir(args) => show_dir(&args.common.crate_.auto_unrelated()?)?,
 
-            opts::Crate::Review(args) => crate_review(args)?,
-            opts::Crate::Unreview(args) => {
-                handle_goto_mode_command(&args.common, |sel| {
-                    let is_advisory = args.advisory
-                        || args.affected.is_some()
-                        || (!args.issue && args.severity.is_some());
-                    create_review_proof(
-                        sel,
-                        if args.issue {
-                            Some(crev_data::Level::Medium)
-                        } else {
-                            None
-                        },
-                        if is_advisory {
-                            Some(opts::AdviseCommon {
-                                severity: args.severity.unwrap_or(crev_data::Level::Medium),
-                                affected: args.affected.unwrap_or(
-                                    crev_data::proof::review::package::VersionRange::Major,
-                                ),
-                            })
-                        } else {
-                            None
-                        },
-                        if is_advisory || args.issue {
-                            TrustProofType::Distrust
-                        } else {
-                            TrustProofType::Untrust
-                        },
-                        &args.common_proof_create,
-                        &args.diff,
-                        args.skip_activity_check || is_advisory || args.issue,
-                        args.overrides,
-                        args.cargo_opts.clone(),
-                    )
-                })?;
-            }
+            opts::Crate::Review(args) => crate_review(&args, TrustProofType::Trust)?,
+            opts::Crate::Unreview(args) => crate_review(&args, TrustProofType::Untrust)?,
             opts::Crate::Search(args) => {
                 lookup_crates(&args.query, args.count)?;
             }
@@ -690,7 +689,11 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                     for_id,
                 } => {
                     let local = Local::auto_create_or_open()?;
-                    local.fetch_trusted(distance_params.into(), for_id.as_deref())?;
+                    local.fetch_trusted(
+                        distance_params.into(),
+                        for_id.as_deref(),
+                        &mut Warning::auto_log(),
+                    )?;
                 }
                 opts::RepoFetch::Url(params) => {
                     let local = Local::auto_create_or_open()?;
@@ -698,10 +701,11 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                 }
                 opts::RepoFetch::All => {
                     let local = Local::auto_create_or_open()?;
-                    local.fetch_all()?;
+                    info!("Fetching...");
+                    local.fetch_all(&mut Warning::auto_log())?;
                 }
             },
-            opts::Repo::Update(args) => repo_update(args)?,
+            opts::Repo::Update(args) => repo_update(args, &mut Warning::auto_log())?,
             opts::Repo::Edit(cmd) => match cmd {
                 opts::RepoEdit::Readme => {
                     let local = crev_lib::Local::auto_open()?;
@@ -732,7 +736,7 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
                             maybe_store(&local, &proof, commit_msg, &args.common)?;
                         }
                         Err(e) => {
-                            eprintln!("Ignoried unknwon proof - {e}");
+                            eprintln!("Ignoried unknown proof - {e}");
                         }
                     }
                 }
@@ -747,16 +751,16 @@ fn run_command(command: opts::Command) -> Result<CommandExitStatus> {
             }
         },
         opts::Command::Goto(args) => {
-            goto_crate_src(&args.crate_.auto_unrelated()?)?;
+            goto_crate_src(&args.auto_unrelated()?)?;
         }
         opts::Command::Open(args) => {
-            handle_goto_mode_command(&args.common.clone(), |crate_| {
+            handle_goto_mode_command(&args.common.clone(), None, |crate_| {
                 crate_open(&crate_.clone().auto_unrelated()?, args.cmd, args.cmd_save)
             })?;
         }
         opts::Command::Publish => repo_publish()?,
-        opts::Command::Review(args) => crate_review(args)?,
-        opts::Command::Update(args) => repo_update(args)?,
+        opts::Command::Review(args) => crate_review(&args, TrustProofType::Trust)?,
+        opts::Command::Update(args) => repo_update(args, &mut Warning::auto_log())?,
 
         opts::Command::Wot(args) => match args {
             opts::Wot::Log { wot } => {
@@ -784,9 +788,18 @@ fn current_id_set_url(url: &str, use_https_push: bool) -> Result<(), crev_lib::E
     let local = Local::auto_open()?;
     let mut locked_id = local.read_current_locked_id()?;
     let pub_id = locked_id.to_public_id().id;
-    local.change_locked_id_url(&mut locked_id, url, use_https_push)?;
+    local.change_locked_id_url(
+        &mut locked_id,
+        url,
+        use_https_push,
+        &mut Warning::auto_log(),
+    )?;
     local.save_current_id(&pub_id)?;
-    local.fetch_trusted(opts::TrustDistanceParams::default().into(), None)?;
+    local.fetch_trusted(
+        opts::TrustDistanceParams::default().into(),
+        None,
+        &mut Warning::auto_log(),
+    )?;
 
     if locked_id.has_no_passphrase() {
         eprintln!("warning: there is no passphrase set. Use `cargo crev id passwd` to fix.");
@@ -828,7 +841,12 @@ fn generate_new_id_interactively(url: Option<&str>, use_https_push: bool) -> Res
                     eprintln!(
                         "Instead of setting up a new CrevID we'll reconfigure the existing one {id}"
                     );
-                    local.change_locked_id_url(&mut locked_id, url, use_https_push)?;
+                    local.change_locked_id_url(
+                        &mut locked_id,
+                        url,
+                        use_https_push,
+                        &mut Warning::auto_log(),
+                    )?;
                     let unlocked_id = local.read_unlocked_id(&id, &|| Ok(String::new()))?;
                     change_passphrase(&local, &unlocked_id, &read_new_passphrase()?)?;
                     local.save_current_id(&id)?;
@@ -837,11 +855,11 @@ fn generate_new_id_interactively(url: Option<&str>, use_https_push: bool) -> Res
             }
 
             // if an old one couldn't be reconfigured automatically, help how to do it manually
-            if let Some(example) = existing_usable.get(0) {
+            if let Some(example) = existing_usable.first() {
                 if local
                     .get_current_userid()
                     .ok()
-                    .map_or(false, |cur| cur == example.id)
+                    .is_some_and(|cur| cur == example.id)
                 {
                     eprintln!("You can configure the existing CrevID with `cargo crev set-url` and `cargo crev id passwd`\n");
                 } else {
@@ -864,10 +882,14 @@ fn generate_new_id_interactively(url: Option<&str>, use_https_push: bool) -> Res
 
     let local = Local::auto_create_or_open()?;
     let res = local
-        .generate_id(url, use_https_push, read_new_passphrase)
-        .map_err(|e| {
+        .generate_id(
+            url,
+            use_https_push,
+            read_new_passphrase,
+            &mut Warning::auto_log(),
+        )
+        .inspect_err(|e| {
             print_crev_proof_repo_fork_help();
-            e
         })?;
     if !res.has_no_passphrase() {
         println!("Your CrevID was created and will be printed below in an encrypted form.");
@@ -964,7 +986,7 @@ fn ensure_crev_id_exists_or_make_one() -> Result<Local> {
             eprintln!(
                 "note: Setting up a default CrevID. Run `cargo crev id new` to customize it."
             );
-            local.generate_id(None, false, || Ok(String::new()))?;
+            local.generate_id(None, false, || Ok(String::new()), &mut Warning::auto_log())?;
         } else {
             eprintln!("You need to select current CrevID. Try:");
             for id in existing {
@@ -990,7 +1012,7 @@ fn load_stdin_with_prompt() -> Result<Vec<u8>> {
     let term = term::Term::new();
 
     if term.is_input_interactive() {
-        eprintln!("Paste in the text and press Ctrl+D.")
+        eprintln!("Paste in the text and press Ctrl+D.");
     }
     let mut s = vec![];
 
@@ -1048,20 +1070,28 @@ fn change_passphrase(
 }
 
 fn main() {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Off)
-        .filter_module("crev_wot", log::LevelFilter::Info)
-        .filter_module("crev_lib", log::LevelFilter::Info)
-        .filter_module("crev_data", log::LevelFilter::Info)
-        .filter_module("crev_common", log::LevelFilter::Info)
-        .filter_module("cargo_crev", log::LevelFilter::Info)
-        .parse_default_env()
-        .filter_module("cargo", log::LevelFilter::Off)
-        .filter_module("tokei", log::LevelFilter::Off)
-        .filter_module("ignore", log::LevelFilter::Off)
-        .filter_module("globset", log::LevelFilter::Off)
-        .filter_module("reqwest", log::LevelFilter::Off)
-        .format(|buf, record| {
+    let mut builder = env_logger::builder();
+    let default_log_settings = std::env::var_os("RUST_LOG").is_none();
+    if default_log_settings {
+        builder
+            .filter_level(log::LevelFilter::Off)
+            .filter_module("crev_wot", log::LevelFilter::Info)
+            .filter_module("crev_lib", log::LevelFilter::Info)
+            .filter_module("crev_data", log::LevelFilter::Info)
+            .filter_module("crev_common", log::LevelFilter::Info)
+            .filter_module("cargo_crev", log::LevelFilter::Info);
+    }
+    builder.parse_default_env();
+    if default_log_settings {
+        builder
+            .filter_module("cargo", log::LevelFilter::Off)
+            .filter_module("tokei", log::LevelFilter::Off)
+            .filter_module("ignore", log::LevelFilter::Off)
+            .filter_module("globset", log::LevelFilter::Off)
+            .filter_module("reqwest", log::LevelFilter::Off);
+    }
+
+    builder.format(|buf, record| {
             if record.level() == log::Level::Info {
                 writeln!(buf, "{}", record.args())
             } else if record.level() > log::Level::Info {

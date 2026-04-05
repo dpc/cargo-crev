@@ -40,6 +40,16 @@ impl ReviewMode {
     }
 }
 
+/// Which review is the most recent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestReviewActivity {
+    pub source: String,
+    pub name: String,
+    pub version: Version,
+    pub diff_base: Option<Version>,
+}
+
+/// Record of an in-progress review
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewActivity {
     #[serde(
@@ -52,17 +62,10 @@ pub struct ReviewActivity {
 
 impl ReviewActivity {
     #[must_use]
-    pub fn new_full() -> Self {
+    pub fn new(diff_base: Option<Version>) -> Self {
         Self {
             timestamp: crev_common::now(),
-            diff_base: None,
-        }
-    }
-    #[must_use]
-    pub fn new_diff(base: &Version) -> Self {
-        Self {
-            timestamp: crev_common::now(),
-            diff_base: Some(base.clone()),
+            diff_base,
         }
     }
 

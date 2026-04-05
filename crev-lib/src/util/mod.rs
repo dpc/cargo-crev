@@ -1,14 +1,10 @@
-use bstr::ByteSlice;
 use crev_common::sanitize_name_for_fs;
 pub use crev_common::{run_with_shell_cmd, store_str_to_file, store_to_file_with};
 use crev_data::proof;
-use std::{
-    self,
-    borrow::Cow,
-    ffi::OsStr,
-    io,
-    path::{Path, PathBuf},
-};
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::io;
+use std::path::{Path, PathBuf};
 
 pub mod git;
 
@@ -48,7 +44,7 @@ pub fn get_recursive_digest_for_paths(
         .build();
 
     let digest_vec = h.get_digest_of(root_path)?;
-    Ok(crev_data::Digest::from_vec(digest_vec).unwrap())
+    Ok(crev_data::Digest::from_bytes(&digest_vec).unwrap())
 }
 
 pub fn get_recursive_digest_for_dir(
@@ -203,7 +199,7 @@ pub fn copy_dir_sanitized(
 fn is_binary_file_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map_or(false, |e| {
+        .is_some_and(|e| {
             matches!(
                 e.to_lowercase().as_str(),
                 "bin"
@@ -221,7 +217,7 @@ fn is_binary_file_extension(path: &Path) -> bool {
         })
 }
 
-fn escape_tricky_unicode(input: &[u8]) -> Cow<[u8]> {
+fn escape_tricky_unicode(input: &[u8]) -> Cow<'_, [u8]> {
     if input.is_ascii() {
         return input.into();
     }
@@ -234,7 +230,7 @@ fn escape_tricky_unicode(input: &[u8]) -> Cow<[u8]> {
     output.into()
 }
 
-fn escape_tricky_unicode_str(input: &str) -> Cow<str> {
+fn escape_tricky_unicode_str(input: &str) -> Cow<'_, str> {
     if input.is_ascii() {
         return input.into();
     }
